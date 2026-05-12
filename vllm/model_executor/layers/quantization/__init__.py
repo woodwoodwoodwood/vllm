@@ -34,6 +34,7 @@ QuantizationMethods = Literal[
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
     "cpu_awq",
+    "milo",
     "online",
     # Below are values of the OnlineQuantScheme enum, specified as strings to
     # avoid circular import issues. This is here to provide a shortcut where
@@ -139,6 +140,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     )
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
+    from .milo import MiloConfig
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
 
@@ -168,6 +170,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "deepseek_v4_fp8": DeepseekV4FP8Config,
         "cpu_awq": CPUAWQConfig,
         "humming": HummingConfig,
+        "milo": MiloConfig,
         "online": OnlineQuantizationConfig,
     }
 
