@@ -589,6 +589,10 @@ class MiloMoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter(name, p)
             set_weight_attrs(p, extra_weight_attrs)
+            # Belt-and-suspenders: ensure quant_method is readable via getattr
+            # even if set_weight_attrs path has issues with Parameter subclass.
+            if not hasattr(p, "quant_method") or p.quant_method is None:
+                p.quant_method = "group"
 
         _reg("w13_Wq_packed1", (K // 16,  2 * I), torch.int32)
         _reg("w13_Wq_packed2", (K // 16,  I),     torch.int32)     # N/2
