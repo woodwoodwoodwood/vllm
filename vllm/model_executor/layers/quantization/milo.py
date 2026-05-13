@@ -647,7 +647,8 @@ class MiloMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         self._ensure_runtime()
         from MiLo.fused_moe.milo_moe import (
-            build_moe_block_descriptors, milo_int3_moe_with_comp)
+            build_moe_block_descriptors, milo_int3_moe)
+        from MiLo.fused_moe.compensator_batched import compensator_batched
 
         device = x.device
         orig_dtype = x.dtype
@@ -662,9 +663,6 @@ class MiloMoEMethod(FusedMoEMethodBase):
         fused = layer._milo_gate_up_fused
         has_comp = (layer._milo_gate_up_V is not None
                     if fused else layer._milo_gate_V is not None)
-        rank = layer._milo_gate_up_V.shape[2] if (
-            has_comp and fused) else (
-            layer._milo_gate_V.shape[2] if has_comp else 0)
 
         # 1. Sorted dispatch
         flat_experts = topk_ids.reshape(-1)
@@ -679,17 +677,22 @@ class MiloMoEMethod(FusedMoEMethodBase):
 
         x_sorted = x_2d[sorted_token_ids].contiguous()
 
-        # 2. Gate+Up (fused or separate) — compensator fused into kernel
+        # 2. Gate+Up (fused or separate) — INT3 GEMM only, compensator later
         if fused:
             gate_up_rail = layer._milo_gate_up_rail
             work_gate_up = build_moe_block_descriptors(
                 bin_edges_cpu, active_experts,
                 prob_n=2 * I, thread_n=gate_up_rail.thread_n,
             ).to(device, non_blocking=True)
-            gate_up_sorted = milo_int3_moe_with_comp(
-                x_sorted, gate_up_rail, work_gate_up,
-                V=layer._milo_gate_up_V, U=layer._milo_gate_up_U,
-                rank=rank, has_comp=has_comp)
+            gate_up_sorted = milo_int3_moe(
+                x_sorted, gate_up_rail, work_gate_up)
+            # Compensator (separate bmm path — uses cuBLAS/Tensor Cores)
+            if has_comp:
+                compensator_batched(
+                    x_sorted, layer._milo_gate_up_V,
+                    layer._milo_gate_up_U,
+                    active_experts, bin_edges_cpu,
+                    gate_up_sorted)
             # SwiGLU: split then activate
             gate_sorted = gate_up_sorted[:, :I]
             up_sorted = gate_up_sorted[:, I:]
@@ -701,14 +704,22 @@ class MiloMoEMethod(FusedMoEMethodBase):
                 bin_edges_cpu, active_experts,
                 prob_n=I, thread_n=gate_rail.thread_n,
             ).to(device, non_blocking=True)
-            gate_sorted = milo_int3_moe_with_comp(
-                x_sorted, gate_rail, work_gate,
-                V=layer._milo_gate_V, U=layer._milo_gate_U,
-                rank=rank, has_comp=has_comp)
-            up_sorted = milo_int3_moe_with_comp(
-                x_sorted, layer._milo_up_rail, work_gate,
-                V=layer._milo_up_V, U=layer._milo_up_U,
-                rank=rank, has_comp=has_comp)
+            gate_sorted = milo_int3_moe(
+                x_sorted, gate_rail, work_gate)
+            if has_comp:
+                compensator_batched(
+                    x_sorted, layer._milo_gate_V,
+                    layer._milo_gate_U,
+                    active_experts, bin_edges_cpu,
+                    gate_sorted)
+            up_sorted = milo_int3_moe(
+                x_sorted, layer._milo_up_rail, work_gate)
+            if has_comp:
+                compensator_batched(
+                    x_sorted, layer._milo_up_V,
+                    layer._milo_up_U,
+                    active_experts, bin_edges_cpu,
+                    up_sorted)
             h_sorted = torch.nn.functional.silu(gate_sorted) * up_sorted
             del gate_sorted, up_sorted
 
@@ -718,10 +729,14 @@ class MiloMoEMethod(FusedMoEMethodBase):
             bin_edges_cpu, active_experts,
             prob_n=K, thread_n=down_rail.thread_n,
         ).to(device, non_blocking=True)
-        down_sorted = milo_int3_moe_with_comp(
-            h_sorted, down_rail, work_down,
-            V=layer._milo_down_V, U=layer._milo_down_U,
-            rank=rank, has_comp=has_comp)
+        down_sorted = milo_int3_moe(
+            h_sorted, down_rail, work_down)
+        if has_comp:
+            compensator_batched(
+                h_sorted, layer._milo_down_V,
+                layer._milo_down_U,
+                active_experts, bin_edges_cpu,
+                down_sorted)
         del h_sorted
 
         # 4. Scatter-add with routing weights
