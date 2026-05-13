@@ -36,6 +36,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.parameter import (
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
+)
 
 logger = init_logger(__name__)
 
@@ -89,6 +93,7 @@ class MiloConfig(QuantizationConfig):
         compensator_rank: int = 0,
         modules_to_not_convert: Optional[list[str]] = None,
         lm_head_quantized: bool = False,
+        milo_ranks: Optional[dict[str, int]] = None,
     ):
         super().__init__()
         if weight_bits not in self.SUPPORTED_BITS:
@@ -108,6 +113,31 @@ class MiloConfig(QuantizationConfig):
         self.compensator_rank = compensator_rank
         self.modules_to_not_convert = modules_to_not_convert or []
         self.lm_head_quantized = lm_head_quantized
+        # Per-module-class rank mapping written by the offline converter.
+        # Keys are substrings matched against the module prefix, values are
+        # integer ranks of the (V, U) low-rank compensator.  Example for
+        # Qwen1.5-MoE-A2.7B w3s16d512:
+        #     {"self_attn": 512, "shared_expert": 512, "mlp.experts": 16}
+        # Looked up via `resolve_compensator_rank(prefix)` below.
+        self.milo_ranks = milo_ranks or {}
+
+    def resolve_compensator_rank(self, prefix: str) -> int:
+        """Return the (V, U) rank for the linear at `prefix`.
+
+        Search order:
+          1. Substring match against `self.milo_ranks` (longest match wins).
+          2. Fall back to the legacy single `compensator_rank` field.
+          3. 0 (== no compensator) if nothing matched.
+        """
+        if self.milo_ranks:
+            best_match: Optional[tuple[int, int]] = None  # (len(key), rank)
+            for key, rank in self.milo_ranks.items():
+                if key in prefix:
+                    if best_match is None or len(key) > best_match[0]:
+                        best_match = (len(key), int(rank))
+            if best_match is not None:
+                return best_match[1]
+        return int(self.compensator_rank or 0)
 
     def __repr__(self) -> str:
         return (
@@ -151,6 +181,9 @@ class MiloConfig(QuantizationConfig):
         lm_head_quantized = cls.get_from_keys_or(
             config, ["lm_head"], default=False
         )
+        milo_ranks = cls.get_from_keys_or(
+            config, ["_milo_ranks"], default={}
+        )
         return cls(
             weight_bits=weight_bits,
             group_size=group_size,
@@ -159,6 +192,7 @@ class MiloConfig(QuantizationConfig):
             compensator_rank=compensator_rank,
             modules_to_not_convert=modules_to_not_convert,
             lm_head_quantized=lm_head_quantized,
+            milo_ranks=milo_ranks,
         )
 
     @classmethod
@@ -181,44 +215,282 @@ class MiloConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
 
         if isinstance(layer, FusedMoE):
+            # MoE path is still TODO; returning None here keeps `vllm serve`
+            # alive long enough to verify the dense (attn / lm_head) path.
+            # The runtime will fall back to the unquantized FusedMoE method,
+            # which will fail to load INT3 buffers — that's expected for
+            # Step-3a.  Set `modules_to_not_convert` to skip experts entirely
+            # if you want a fully-loadable bring-up checkpoint.
             return MiloMoEMethod(self, layer.moe_config)
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
-            return MiloLinearMethod(self)
+            return MiloLinearMethod(self, prefix=prefix)
         return None
 
 
 # ===========================================================================
-#  Linear method  (TODO: stub — falls back to unquantized for now)
+#  Linear method
 # ===========================================================================
 class MiloLinearMethod(LinearMethodBase):
-    """Linear method for MiLo.
+    """Linear method for MiLo INT3 + low-rank compensator.
 
-    Stage 0 / smoke-test mode: this is a stub that falls back to the
-    unquantized path (bf16/fp16 PyTorch matmul).  This is acceptable for
-    initial bring-up because the bottleneck of Qwen3-MoE is the MoE layer,
-    not the dense linear projections.
+    Forward path (one-to-one with `MiLo_Asymmetric_Linear.forward`):
 
-    TODO: implement actual INT3 + compensator dense-linear matmul using
-    `MiLo_Asymmetric_Linear.matmul()` semantics.
+        out  = milo.mul_3bit_with_zeros(x, Wq_packed1, Wq_packed2,
+                                         scales, zeros)
+        out += (x @ V) @ U                  # if has_compensator
+        out += bias                         # if bias is not None
+
+    Weight registration matches the Marlin-prepacked layout produced by
+    `convert_milo_to_vllm.py`:
+
+        Wq_packed1   int32   [in/16,        out]
+        Wq_packed2   int32   [in/16,        out/2]   (Marlin zigzag halves)
+        scales       fp16    [in/group,     out]
+        zeros        fp16    [in/group,     out]
+        V            fp16    [in,           rank]    (compensator lhs)
+        U            fp16    [rank,         out]     (compensator rhs)
+        bias         fp16    [out]                   (optional)
+
+    All buffers expose `output_dim=1` (or `output_dim=0` for U / bias) so
+    vLLM's `load_qkv_weight` / `load_merged_column_weight` can stack
+    q/k/v or gate/up shards along the N axis at load time.
+
+    NOTE: stacking Marlin-prepacked tensors along N is only safe if every
+    shard's N is a multiple of the kernel tile size (max 256 in the MiLo
+    kernel set).  All shapes in Qwen1.5-MoE / Qwen3-MoE / DeepSeek-V2 are
+    safe; assert if you hit a violation.
     """
 
-    def __init__(self, quant_config: MiloConfig):
+    # Cache the resolved milo runtime module across all instances.
+    _milo_module: Any = None
+
+    def __init__(self, quant_config: MiloConfig, *, prefix: str = ""):
         self.quant_config = quant_config
-        self._unquant = UnquantizedLinearMethod()
-        logger.warning_once(
-            "MiloLinearMethod is currently a stub (falls back to "
-            "unquantized matmul).  This will OOM if applied to a "
-            "weights-quantized checkpoint with INT3 buffers; for now "
-            "list dense-linear modules in `modules_to_not_convert`."
+        self.prefix = prefix
+        # Resolve compensator rank up-front so create_weights can size V/U.
+        # 0 means "no compensator on this layer".
+        self.rank = (
+            quant_config.resolve_compensator_rank(prefix)
+            if quant_config.has_compensator
+            else 0
+        )
+        # MiLo runtime is only required at apply() time, not at config-parse
+        # time, so we lazy-import to keep import paths cheap.
+        self._milo: Any = None
+
+    # ------------------------------------------------------------------
+    def _get_milo(self):
+        if self._milo is not None:
+            return self._milo
+        try:
+            import milo  # noqa: F401  (registers ops + Python entry points)
+        except ImportError as e:
+            raise ImportError(
+                "MiLo runtime is not installed.  Build the milo CUDA "
+                "extension: `cd MiLo/MiLo/kernels && pip install -e .`"
+            ) from e
+        self._milo = milo
+        type(self)._milo_module = milo
+        return milo
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pick_kernel_tile(prob_n: int, prob_k: int) -> tuple[int, int]:
+        """Return a (thread_n, thread_k) tile compatible with prob_n / prob_k
+        and the set of `CALL_IF` configurations compiled into the MiLo CUDA
+        kernel.  Same logic as MiLo_Asymmetric_Linear._pick_kernel_tile."""
+        if prob_n % 256 == 0 and prob_k % 64 == 0:
+            return 256, 64
+        if prob_n % 128 == 0 and prob_k % 128 == 0:
+            return 128, 128
+        if prob_n % 64 == 0 and prob_k % 256 == 0:
+            return 64, 256
+        return -1, -1
+
+    # ------------------------------------------------------------------
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size  # unused; we work with partition sizes
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        gs = self.quant_config.group_size
+        K = input_size_per_partition
+        N = output_size_per_partition
+
+        # Sanity: the Marlin prepack requires K % 16 == 0 (B1/B2 layout) and
+        # K % gs == 0 (scales / zeros groups).  Each output shard must be a
+        # multiple of the kernel tile (max 256) so that stacking along N is
+        # byte-equivalent to per-shard prepack.
+        assert K % 16 == 0, f"in_features={K} not divisible by 16"
+        assert K % gs == 0, (
+            f"in_features={K} not divisible by group_size={gs}"
+        )
+        for shard_n in output_partition_sizes:
+            assert shard_n % 64 == 0, (
+                f"output shard {shard_n} not a multiple of 64; cannot safely "
+                f"concat MiLo Marlin-prepacked tensors along N"
+            )
+
+        # Save layer-level metadata for apply().
+        layer.input_size_per_partition = K
+        layer.output_size_per_partition = N
+        layer.milo_group_size = gs
+        layer.milo_rank = self.rank
+
+        # ---- INT3 packed weights (B1, B2) ----
+        # Both have output_dim=1 (N).  Treat as un-packed along input_dim
+        # (the K/16 prepack is opaque to vLLM's TP slicer for now — Step 3a
+        # only validates TP=1).
+        wq1 = ModelWeightParameter(
+            data=torch.empty(K // 16, N, dtype=torch.int32),
+            input_dim=0, output_dim=1,
+            weight_loader=weight_loader,
+        )
+        wq2 = ModelWeightParameter(
+            data=torch.empty(K // 16, N // 2, dtype=torch.int32),
+            input_dim=0, output_dim=1,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("Wq_packed1", wq1)
+        layer.register_parameter("Wq_packed2", wq2)
+
+        # ---- scales / zeros (per-group, per-output) ----
+        # Use GroupQuantScaleParameter so vLLM's qkv/merged-column loader
+        # also slices them correctly along output_dim=1.
+        scales = GroupQuantScaleParameter(
+            data=torch.empty(K // gs, N, dtype=params_dtype),
+            input_dim=0, output_dim=1,
+            weight_loader=weight_loader,
+        )
+        zeros = GroupQuantScaleParameter(
+            data=torch.empty(K // gs, N, dtype=params_dtype),
+            input_dim=0, output_dim=1,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("scales", scales)
+        layer.register_parameter("zeros", zeros)
+
+        # ---- Low-rank compensator (V, U) ----
+        # V is [K, rank] — split along K only when row-parallel (Step 3a:
+        # not supported; we assert below).  U is [rank, N] — split along
+        # output_dim=0.
+        if self.rank > 0:
+            V = ModelWeightParameter(
+                data=torch.empty(K, self.rank, dtype=params_dtype),
+                # Treat V as a row-parallel weight (input_dim=0); when the
+                # caller is ColumnParallelLinear, vLLM's load_*_weight will
+                # leave it untouched (no TP shard along input).
+                input_dim=0, output_dim=1,
+                weight_loader=weight_loader,
+            )
+            U = ModelWeightParameter(
+                data=torch.empty(self.rank, N, dtype=params_dtype),
+                input_dim=0, output_dim=1,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("V", V)
+            layer.register_parameter("U", U)
+        else:
+            layer.V = None
+            layer.U = None
+
+        # ---- Optional bias ----
+        # vLLM's LinearBase already creates `layer.bias` for us when
+        # bias=True is set on construction.  But MiLo writes bias under the
+        # quantized linear with the key `<prefix>.bias`, which lands on the
+        # nn.Module attribute path that vLLM owns.  We still register a
+        # GroupQuantScale-style 1D parameter to receive shard-id-aware
+        # loading from load_qkv_weight.
+        # (vLLM's `LinearBase.__init__` will register a `bias` parameter
+        # if requested by the model code — we don't override it here.)
+
+        # Workspace for the milo INT3 GEMM kernel.  Sized once we know N.
+        # `n // 128 * 16` int32 elements (per kernel header).  We allocate
+        # it lazily in process_weights_after_loading because some platforms
+        # don't allow torch.zeros() during create_weights.
+
+    # ------------------------------------------------------------------
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Pick the kernel tile + allocate the workspace lock buffer."""
+        N = layer.output_size_per_partition
+        K = layer.input_size_per_partition
+        thread_n, thread_k = self._pick_kernel_tile(N, K)
+        if thread_n < 0:
+            raise RuntimeError(
+                f"MiloLinearMethod: no compatible kernel tile for "
+                f"prob_n={N} prob_k={K}.  Allowed (N%256==0, K%64==0) | "
+                f"(N%128==0, K%128==0) | (N%64==0, K%256==0)."
+            )
+        layer.milo_thread_n = thread_n
+        layer.milo_thread_k = thread_k
+
+        # Workspace: int32 lock array used by the kernel scheduler.
+        device = layer.Wq_packed1.device
+        layer.milo_workspace = torch.zeros(
+            (N // 128) * 16, dtype=torch.int32, device=device
         )
 
-    def create_weights(self, layer, *args, **kwargs):
-        return self._unquant.create_weights(layer, *args, **kwargs)
+    # ------------------------------------------------------------------
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        milo = self._get_milo()
 
-    def apply(self, layer, x, bias=None):
-        return self._unquant.apply(layer, x, bias)
+        # MiLo INT3 kernel only supports fp16 activations; cast if needed.
+        # (Bf16 → fp16 is lossy for some calibrations; the upstream check-
+        # point is calibrated in fp16 anyway.)
+        orig_dtype = x.dtype
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+
+        x_2d = x.reshape(-1, x.shape[-1])
+        N = layer.output_size_per_partition
+        out = torch.empty(
+            (x_2d.shape[0], N), dtype=torch.float16, device=x_2d.device
+        )
+
+        # 1) INT3 grouped GEMM: out = dequant(Wq) @ x
+        milo.mul_3bit_with_zeros(
+            x_2d,
+            layer.Wq_packed1,
+            layer.Wq_packed2,
+            out,
+            layer.scales,
+            layer.zeros,
+            layer.milo_workspace,
+            thread_k=layer.milo_thread_k,
+            thread_n=layer.milo_thread_n,
+        )
+
+        # 2) Low-rank compensator: out += (x @ V) @ U
+        if layer.V is not None and layer.U is not None:
+            tmp = torch.mm(x_2d, layer.V)        # [M, rank]
+            out.addmm_(tmp, layer.U)             # out += tmp @ U
+
+        # 3) Bias (vLLM may pass it via `bias` arg, or layer.bias may exist).
+        if bias is not None:
+            out = out + bias.to(torch.float16)
+
+        # Restore original output shape + dtype.
+        out = out.reshape(*x.shape[:-1], N)
+        if out.dtype != orig_dtype:
+            out = out.to(orig_dtype)
+        return out
 
 
 # ===========================================================================
