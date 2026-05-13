@@ -352,17 +352,22 @@ class MiloLinearMethod(LinearMethodBase):
         layer.milo_rank = self.rank
 
         # ---- INT3 packed weights (B1, B2) ----
-        # Both have output_dim=1 (N).  Treat as un-packed along input_dim
-        # (the K/16 prepack is opaque to vLLM's TP slicer for now — Step 3a
-        # only validates TP=1).
+        # B1 has shape [K/16, N] — output_dim=1 lines up with N directly.
+        # B2 has shape [K/16, N/2] — output dimension is packed 2:1 relative
+        # to the logical output size N, so we use PackedvLLMParameter with
+        # packed_factor=2 on output_dim=1.  This makes vLLM's merged-column /
+        # QKV loader divide shard_size by 2 when narrowing B2.
+        from vllm.model_executor.parameter import PackedvLLMParameter
+
         wq1 = ModelWeightParameter(
             data=torch.empty(K // 16, N, dtype=torch.int32),
             input_dim=0, output_dim=1,
             weight_loader=weight_loader,
         )
-        wq2 = ModelWeightParameter(
+        wq2 = PackedvLLMParameter(
             data=torch.empty(K // 16, N // 2, dtype=torch.int32),
             input_dim=0, output_dim=1,
+            packed_dim=1, packed_factor=2,
             weight_loader=weight_loader,
         )
         layer.register_parameter("Wq_packed1", wq1)
