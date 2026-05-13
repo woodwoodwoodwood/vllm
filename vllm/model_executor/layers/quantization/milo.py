@@ -500,7 +500,10 @@ class MiloLinearMethod(LinearMethodBase):
         )
 
         # 2) Low-rank compensator: out += (x @ V) @ U
-        if layer.V is not None and layer.U is not None:
+        # Set MILO_SKIP_COMPENSATOR=1 to disable for debugging.
+        import os
+        _skip_comp = os.environ.get("MILO_SKIP_COMPENSATOR", "0") == "1"
+        if not _skip_comp and layer.V is not None and layer.U is not None:
             tmp = torch.mm(x_2d, layer.V)        # [M, rank]
             out.addmm_(tmp, layer.U)             # out += tmp @ U
 
@@ -741,7 +744,9 @@ class MiloMoEMethod(FusedMoEMethodBase):
         top_k = topk_ids.shape[-1]
         I = layer.milo_intermediate_size
         E = layer.milo_num_experts
-        has_comp = layer._milo_gate_V is not None
+        import os
+        _skip_comp = os.environ.get("MILO_SKIP_COMPENSATOR", "0") == "1"
+        has_comp = (not _skip_comp) and (layer._milo_gate_V is not None)
 
         # ---- 1. Sorted dispatch ----
         flat_experts = topk_ids.reshape(-1)                    # [M*top_k]
