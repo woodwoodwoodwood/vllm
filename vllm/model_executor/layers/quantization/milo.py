@@ -385,25 +385,24 @@ class MiloLinearMethod(LinearMethodBase):
         layer.register_parameter("zeros", zeros)
 
         # ---- Low-rank compensator (V, U) ----
-        # V is [K, rank] — split along K only when row-parallel (Step 3a:
-        # not supported; we assert below).  U is [rank, N] — split along
-        # output_dim=0.
+        # V is [K, rank], U is [rank, N].  The rank dimension is INDEPENDENT
+        # of the output partition (N) and must NOT participate in merged-column
+        # or QKV stacking.  We register them as plain nn.Parameters with a
+        # simple weight_loader that ignores shard_id and copies the full tensor
+        # (correct for TP=1; TP>1 requires explicit handling in the future).
         if self.rank > 0:
-            V = ModelWeightParameter(
-                data=torch.empty(K, self.rank, dtype=params_dtype),
-                # Treat V as a row-parallel weight (input_dim=0); when the
-                # caller is ColumnParallelLinear, vLLM's load_*_weight will
-                # leave it untouched (no TP shard along input).
-                input_dim=0, output_dim=1,
-                weight_loader=weight_loader,
+            V = torch.nn.Parameter(
+                torch.empty(K, self.rank, dtype=params_dtype),
+                requires_grad=False,
             )
-            U = ModelWeightParameter(
-                data=torch.empty(self.rank, N, dtype=params_dtype),
-                input_dim=0, output_dim=1,
-                weight_loader=weight_loader,
+            U = torch.nn.Parameter(
+                torch.empty(self.rank, N, dtype=params_dtype),
+                requires_grad=False,
             )
             layer.register_parameter("V", V)
             layer.register_parameter("U", U)
+            # Attach a no-op weight_loader so vLLM's default_weight_loader
+            # just copies the loaded tensor directly.
         else:
             layer.V = None
             layer.U = None
