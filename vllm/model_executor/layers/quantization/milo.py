@@ -656,6 +656,21 @@ class MiloMoEMethod(FusedMoEMethodBase):
         E = layer.milo_num_experts
         rank = layer.milo_rank
 
+        # Debug: verify expert 0 gate_proj B1 matches ckpt on first layer
+        if hasattr(layer, '_milo_debug_done'):
+            pass
+        else:
+            layer._milo_debug_done = True
+            w13 = layer.w13_Wq_packed1  # [E, K/16, 2*I]
+            logger.info(
+                "DEBUG process_weights: w13_Wq_packed1 shape=%s, "
+                "expert0 gate [:2,:2]=%s, expert0 nonzero=%d/%d",
+                list(w13.shape),
+                w13[0, :2, :2].tolist(),
+                (w13[0] != 0).sum().item(),
+                w13[0].numel(),
+            )
+
         # Tile selection
         tile_gate_n, tile_gate_k = MiloLinearMethod._pick_kernel_tile(I, K)
         tile_down_n, tile_down_k = MiloLinearMethod._pick_kernel_tile(K, I)
