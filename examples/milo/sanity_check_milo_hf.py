@@ -52,7 +52,11 @@ def main() -> None:
     print("[1/4] Importing MiLo HF runtime ...", flush=True)
     t0 = time.time()
     try:
-        from MiLo.core.quantize import *  # noqa: F401, F403  (registers backend)
+        # MiLo's eval scripts use `from MiLo.core.quantize import *` at module
+        # level to register quantizer backends.  Python forbids `import *`
+        # inside a function body, so we import the module — its top-level
+        # side effects (backend registration) run on first import either way.
+        import MiLo.core.quantize  # noqa: F401  (registers backend)
         from MiLo.models.hf.qwen2_moe import Qwen2MoEMiLo
         from MiLo.engine.hf import AutoTokenizer
     except ImportError as e:
