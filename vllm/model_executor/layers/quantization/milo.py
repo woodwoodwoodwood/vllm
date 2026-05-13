@@ -571,7 +571,12 @@ class MiloMoEMethod(FusedMoEMethodBase):
         )
 
         # Mark transposed so weight_loader flips shard_dim correctly.
-        extra_weight_attrs.update({"is_transposed": True})
+        # "quant_method": "group" tells the weight_loader how to handle
+        # scales/zeros (same group-quantization loading path as GPTQ).
+        extra_weight_attrs.update({
+            "is_transposed": True,
+            "quant_method": "group",
+        })
 
         # ---------- w13 (gate + up, fused along N=2*I) ----------
         def _reg(name, shape, dtype=torch.int32):
