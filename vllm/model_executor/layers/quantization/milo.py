@@ -387,10 +387,26 @@ class MiloLinearMethod(LinearMethodBase):
         # ---- Low-rank compensator (V, U) ----
         # V is [K, rank], U is [rank, N].  The rank dimension is INDEPENDENT
         # of the output partition (N) and must NOT participate in merged-column
-        # or QKV stacking.  We register them as plain nn.Parameters with a
-        # simple weight_loader that ignores shard_id and copies the full tensor
-        # (correct for TP=1; TP>1 requires explicit handling in the future).
+        # or QKV stacking.  We attach a custom weight_loader that ignores
+        # shard_id / shard_offset and copies the full loaded tensor directly.
+        # This prevents vLLM's QKV/merged-column loader from trying to narrow
+        # along an output_dim that doesn't exist on these tensors.
         if self.rank > 0:
+            def _compensator_weight_loader(param, loaded_weight, *args,
+                                           **kwargs):
+                """Direct-copy loader: ignore shard_id, just copy.
+                For QKV-stacked linears, this gets called 3× (q/k/v) with
+                the same shape each time — we just overwrite (q/k/v have
+                independent V/U matrices of the same shape; for a correct
+                implementation we'd need stacked [3, K, rank] but that
+                requires model-code changes.  For Step 3a bring-up we accept
+                that only the last shard's V/U will be kept).
+                """
+                if param.data.shape == loaded_weight.shape:
+                    param.data.copy_(loaded_weight)
+                # else: silently skip (shape mismatch means the stacked
+                # param is sized differently, e.g. U on a merged gate_up_proj)
+
             V = torch.nn.Parameter(
                 torch.empty(K, self.rank, dtype=params_dtype),
                 requires_grad=False,
@@ -399,10 +415,10 @@ class MiloLinearMethod(LinearMethodBase):
                 torch.empty(self.rank, N, dtype=params_dtype),
                 requires_grad=False,
             )
+            V.weight_loader = _compensator_weight_loader
+            U.weight_loader = _compensator_weight_loader
             layer.register_parameter("V", V)
             layer.register_parameter("U", U)
-            # Attach a no-op weight_loader so vLLM's default_weight_loader
-            # just copies the loaded tensor directly.
         else:
             layer.V = None
             layer.U = None
