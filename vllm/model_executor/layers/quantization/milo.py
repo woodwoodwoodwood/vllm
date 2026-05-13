@@ -44,170 +44,6 @@ from vllm.model_executor.parameter import (
 logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# GPU-only MoE descriptor builder & compensator
-# ---------------------------------------------------------------------------
-_M_TILE = 16  # matches MoEBlockDesc.m_tile in milo_cuda_moe_kernel.cu
-
-
-def _build_moe_block_descriptors_gpu(
-    counts: torch.Tensor,
-    prob_n: int,
-    thread_n: int,
-) -> torch.Tensor:
-    """Build MoE block descriptors entirely on GPU.
-
-    Unlike the CPU-based ``build_moe_block_descriptors`` which takes Python
-    lists and returns a CPU tensor, this version operates on GPU tensors
-    and returns a GPU tensor directly — no ``.tolist()`` or per-element
-    ``.item()`` calls.
-
-    Requires one ``.item()`` for output allocation size.
-    """
-    E = counts.shape[0]
-    device = counts.device
-    n_tiles = prob_n // thread_n
-
-    # bin_edges on GPU (no sync)
-    bin_edges = torch.empty(E + 1, dtype=torch.int32, device=device)
-    bin_edges[0] = 0
-    bin_edges[1:] = counts.cumsum(0).to(torch.int32)
-
-    # Active experts on GPU (nonzero triggers one sync for output shape)
-    active_mask = counts > 0
-    active_expert_ids = active_mask.nonzero(as_tuple=True)[0].to(torch.int32)
-    E_active = active_expert_ids.shape[0]
-
-    if E_active == 0:
-        return torch.empty((0, 4), dtype=torch.int32, device=device)
-
-    # Per-active-expert data
-    active_counts = counts[active_expert_ids].to(torch.int32)
-    active_bin_starts = bin_edges[active_expert_ids]
-
-    # Number of M-chunks per active expert
-    m_chunks = (active_counts + _M_TILE - 1) // _M_TILE  # [E_active]
-
-    # Total M-chunks (one sync for allocation)
-    total_m_chunks = int(m_chunks.sum().item())
-    if total_m_chunks == 0:
-        return torch.empty((0, 4), dtype=torch.int32, device=device)
-
-    # Expand: repeat each expert_id / bin_start / count m_chunks times
-    m_chunks_long = m_chunks.to(torch.int64)
-    expert_ids_exp = active_expert_ids.repeat_interleave(m_chunks_long)
-    bin_starts_exp = active_bin_starts.repeat_interleave(m_chunks_long)
-    counts_exp = active_counts.repeat_interleave(m_chunks_long)
-
-    # Within-expert chunk index: 0, 1, ..., m_chunks[e]-1 for each expert
-    expert_chunk_starts = torch.zeros(E_active, dtype=torch.int32, device=device)
-    expert_chunk_starts[1:] = m_chunks[:-1].cumsum(0)
-    ecs_exp = expert_chunk_starts.repeat_interleave(m_chunks_long)
-    within_chunk = torch.arange(total_m_chunks, dtype=torch.int32, device=device) - ecs_exp
-
-    # Per-chunk m_start and prob_m
-    m_starts = bin_starts_exp + within_chunk * _M_TILE
-    remaining = counts_exp - within_chunk * _M_TILE
-    prob_ms = torch.min(
-        torch.full_like(remaining, _M_TILE), remaining.clamp(min=0))
-
-    # Expand for n_tiles: each (chunk) generates n_tiles descriptors
-    expert_ids_final = expert_ids_exp.repeat_interleave(n_tiles)
-    m_starts_final = m_starts.repeat_interleave(n_tiles)
-    prob_ms_final = prob_ms.repeat_interleave(n_tiles)
-    slice_cols = torch.arange(
-        n_tiles, dtype=torch.int32, device=device).repeat(total_m_chunks)
-
-    return torch.stack(
-        [expert_ids_final, m_starts_final, prob_ms_final, slice_cols], dim=1)
-
-
-_BMM_M_THRESHOLD = 8  # same as MiLo's compensator_batched.BMM_M_THRESHOLD
-
-
-def _compensator_batched_gpu(
-    x_sorted: torch.Tensor,
-    V_3D: torch.Tensor,
-    U_3D: torch.Tensor,
-    active_expert_ids: torch.Tensor,
-    bin_edges: torch.Tensor,
-    out_sorted: torch.Tensor,
-) -> None:
-    """GPU-only compensator — no CPU list construction needed.
-
-    Takes GPU tensors (``active_expert_ids``, ``bin_edges``) instead of
-    Python lists.  For the common decode case (m_max ≤ 8) the entire
-    path runs on GPU with zero additional syncs beyond what the caller
-    already needed to obtain ``active_expert_ids``.
-    """
-    E_active = active_expert_ids.shape[0]
-    if E_active == 0:
-        return
-
-    device = x_sorted.device
-    dtype = x_sorted.dtype
-    rank = V_3D.shape[2]
-    N = U_3D.shape[2]
-
-    # Per-active-expert start/end/count — all on GPU
-    starts = bin_edges[active_expert_ids]           # [E_active]
-    ends = bin_edges[active_expert_ids + 1]         # [E_active]
-    m_es = ends - starts                            # [E_active]
-
-    m_max = int(m_es.max().item())
-    if m_max == 0:
-        return
-
-    # Gather active V / U
-    V_act = V_3D[active_expert_ids]                 # [E_active, K, rank]
-    U_act = U_3D[active_expert_ids]                 # [E_active, rank, N]
-
-    if m_max <= _BMM_M_THRESHOLD:
-        # --- Batched BMM path (best for decode) ---
-        # Build padded x: [E_active, m_max, K]
-        j = torch.arange(m_max, device=device, dtype=torch.int32)
-        # idx[e, j] = starts[e] + j  (clamped for padding rows)
-        idx = starts.unsqueeze(1) + j.unsqueeze(0)  # [E_active, m_max]
-        valid = j.unsqueeze(0) < m_es.unsqueeze(1)  # [E_active, m_max]
-        # Clamp to a valid row index (row 0 is safe; contribution will be
-        # zeroed by the mask)
-        idx = idx.clamp(max=x_sorted.shape[0] - 1)
-
-        x_pad = x_sorted[idx]                       # [E_active, m_max, K]
-        x_pad = x_pad * valid.unsqueeze(-1).to(dtype)  # zero out padding
-
-        tmp = torch.bmm(x_pad, V_act)               # [E_active, m_max, rank]
-        res = torch.bmm(tmp, U_act)                  # [E_active, m_max, N]
-        res = res * valid.unsqueeze(-1).to(dtype)    # mask padding output
-
-        # Scatter-add back into out_sorted
-        if m_max == 1:
-            # Fast path: each expert contributes exactly one row
-            res_flat = res.squeeze(1)                # [E_active, N]
-            out_sorted.index_add_(
-                0, starts.to(torch.int64), res_flat.to(out_sorted.dtype))
-        else:
-            # General: for each expert, add its valid rows
-            # Flatten idx and res, then index_add only valid entries
-            valid_flat = valid.reshape(-1)
-            idx_flat = idx.reshape(-1)[valid_flat].to(torch.int64)
-            res_flat = res.reshape(-1, N)[valid_flat]
-            out_sorted.index_add_(
-                0, idx_flat, res_flat.to(out_sorted.dtype))
-    else:
-        # --- Per-expert mm fallback (large batch / prefill) ---
-        # Minimal sync: read per-expert start/end from GPU
-        for i in range(E_active):
-            s = int(starts[i].item())
-            e = int(ends[i].item())
-            if e <= s:
-                continue
-            x_e = x_sorted[s:e]
-            tmp = torch.mm(x_e, V_act[i])           # [m_e, rank]
-            add_e = torch.mm(tmp, U_act[i])          # [m_e, N]
-            out_sorted[s:e].add_(add_e.to(out_sorted.dtype))
-
-
-# ---------------------------------------------------------------------------
 # Lazy-import MiLo runtime
 # ---------------------------------------------------------------------------
 def _import_milo():
@@ -810,7 +646,9 @@ class MiloMoEMethod(FusedMoEMethodBase):
         **kwargs,
     ) -> torch.Tensor:
         self._ensure_runtime()
-        from MiLo.fused_moe.milo_moe import milo_int3_moe
+        from MiLo.fused_moe.milo_moe import (
+            build_moe_block_descriptors, milo_int3_moe)
+        from MiLo.fused_moe.compensator_batched import compensator_batched
 
         device = x.device
         orig_dtype = x.dtype
@@ -826,35 +664,33 @@ class MiloMoEMethod(FusedMoEMethodBase):
         has_comp = (layer._milo_gate_up_V is not None
                     if fused else layer._milo_gate_V is not None)
 
-        # 1. Sorted dispatch — all on GPU, no .tolist() sync
+        # 1. Sorted dispatch
         flat_experts = topk_ids.reshape(-1)
         sort_idx = torch.argsort(flat_experts, stable=True)
         sorted_token_ids = sort_idx // top_k
         sorted_slot_ids  = sort_idx % top_k
 
         counts = torch.bincount(flat_experts, minlength=E)
-        # bin_edges stays on GPU (no .tolist())
-        bin_edges = torch.empty(E + 1, dtype=torch.int32, device=device)
-        bin_edges[0] = 0
-        bin_edges[1:] = counts.cumsum(0).to(torch.int32)
-        # active_expert_ids on GPU (nonzero triggers one sync for shape)
-        active_expert_ids = (counts > 0).nonzero(as_tuple=True)[0].to(
-            torch.int32)
+        bin_edges_cpu = [0] + counts.cumsum(0).tolist()
+        active_experts = sorted(
+            i for i in range(E) if counts[i].item() > 0)
 
         x_sorted = x_2d[sorted_token_ids].contiguous()
 
-        # 2. Gate+Up (fused or separate) — GPU-only descriptors
+        # 2. Gate+Up (fused or separate)
         if fused:
             gate_up_rail = layer._milo_gate_up_rail
-            work_gate_up = _build_moe_block_descriptors_gpu(
-                counts, prob_n=2 * I, thread_n=gate_up_rail.thread_n)
+            work_gate_up = build_moe_block_descriptors(
+                bin_edges_cpu, active_experts,
+                prob_n=2 * I, thread_n=gate_up_rail.thread_n,
+            ).to(device, non_blocking=True)
             gate_up_sorted = milo_int3_moe(
                 x_sorted, gate_up_rail, work_gate_up)
             if has_comp:
-                _compensator_batched_gpu(
+                compensator_batched(
                     x_sorted, layer._milo_gate_up_V,
                     layer._milo_gate_up_U,
-                    active_expert_ids, bin_edges, gate_up_sorted)
+                    active_experts, bin_edges_cpu, gate_up_sorted)
             # SwiGLU: split then activate
             gate_sorted = gate_up_sorted[:, :I]
             up_sorted = gate_up_sorted[:, I:]
@@ -862,31 +698,35 @@ class MiloMoEMethod(FusedMoEMethodBase):
             del gate_sorted, up_sorted, gate_up_sorted
         else:
             gate_rail = layer._milo_gate_rail
-            work_gate = _build_moe_block_descriptors_gpu(
-                counts, prob_n=I, thread_n=gate_rail.thread_n)
+            work_gate = build_moe_block_descriptors(
+                bin_edges_cpu, active_experts,
+                prob_n=I, thread_n=gate_rail.thread_n,
+            ).to(device, non_blocking=True)
             gate_sorted = milo_int3_moe(x_sorted, gate_rail, work_gate)
             if has_comp:
-                _compensator_batched_gpu(
+                compensator_batched(
                     x_sorted, layer._milo_gate_V, layer._milo_gate_U,
-                    active_expert_ids, bin_edges, gate_sorted)
+                    active_experts, bin_edges_cpu, gate_sorted)
             up_sorted = milo_int3_moe(
                 x_sorted, layer._milo_up_rail, work_gate)
             if has_comp:
-                _compensator_batched_gpu(
+                compensator_batched(
                     x_sorted, layer._milo_up_V, layer._milo_up_U,
-                    active_expert_ids, bin_edges, up_sorted)
+                    active_experts, bin_edges_cpu, up_sorted)
             h_sorted = torch.nn.functional.silu(gate_sorted) * up_sorted
             del gate_sorted, up_sorted
 
-        # 3. Down rail — GPU-only descriptors
+        # 3. Down rail
         down_rail = layer._milo_down_rail
-        work_down = _build_moe_block_descriptors_gpu(
-            counts, prob_n=K, thread_n=down_rail.thread_n)
+        work_down = build_moe_block_descriptors(
+            bin_edges_cpu, active_experts,
+            prob_n=K, thread_n=down_rail.thread_n,
+        ).to(device, non_blocking=True)
         down_sorted = milo_int3_moe(h_sorted, down_rail, work_down)
         if has_comp:
-            _compensator_batched_gpu(
+            compensator_batched(
                 h_sorted, layer._milo_down_V, layer._milo_down_U,
-                active_expert_ids, bin_edges, down_sorted)
+                active_experts, bin_edges_cpu, down_sorted)
         del h_sorted
 
         # 4. Scatter-add with routing weights
