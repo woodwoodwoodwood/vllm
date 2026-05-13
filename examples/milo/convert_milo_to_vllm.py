@@ -163,11 +163,15 @@ def _collect_state_dict(model, MiLo_Asymmetric_Linear,
 
     # Buffers (e.g. RMSNorm running stats are usually parameters in HF
     # configs, but include them defensively).
+    # Skip rotary embedding buffers — vLLM recomputes these from config.
+    _SKIP_BUFFER_PATTERNS = ("rotary_emb", "inv_freq")
     for bname, buf in model.named_buffers():
         if any(bname.startswith(m + ".") or bname == m
                for m in visited_quant_modules):
             continue
         if bname in sd:
+            continue
+        if any(pat in bname for pat in _SKIP_BUFFER_PATTERNS):
             continue
         cpu_t = buf.detach().to("cpu", copy=True).contiguous()
         sd[bname] = cpu_t
