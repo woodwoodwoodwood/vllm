@@ -314,68 +314,94 @@ class MiloLinearMethod(LinearMethodBase):
         layer.register_parameter("zeros", zeros)
 
         # V/U compensator for stacked layers (QKV, gate_up):
-        # - V is [K, rank] and shared across all shards (same input dim).
-        #   We simply copy from any shard (they should all be identical).
-        # - U is [rank, N_total] where N_total = sum(output_partition_sizes).
-        #   Each shard contributes [rank, N_shard] which must be placed at
-        #   the correct offset along dim=1.
+        #
+        # For stacked layers each shard has independent V_i [K, rank] and
+        # U_i [rank, N_i].  We store them in expanded form:
+        #   V: [K, num_shards * rank]  — V_i at columns [i*rank : (i+1)*rank]
+        #   U: [num_shards * rank, N]  — U_i at rows [i*rank : (i+1)*rank],
+        #                                 cols [output_offset : output_offset + N_i]
+        #
+        # Forward: out += (x @ V) @ U
+        # This is equivalent to: for each shard i,
+        #   out[:, offset_i:offset_i+N_i] += (x @ V_i) @ U_i
+        #
+        # For non-stacked layers (single shard), this reduces to the normal
+        # V [K, rank], U [rank, N] with a single copy.
         if self.rank > 0:
-            # Store partition info for the U loader to compute offsets.
+            num_shards = len(output_partition_sizes)
             layer._milo_output_partition_sizes = list(output_partition_sizes)
+            layer._milo_num_shards = num_shards
+            rank = self.rank
 
-            def _v_loader(param, loaded_weight, *args, **kwargs):
-                """V: [K, rank] - same for all shards, just copy."""
-                if param.data.shape == loaded_weight.shape:
-                    param.data.copy_(loaded_weight)
-
-            def _u_loader(param, loaded_weight, *args, **kwargs):
-                """U: [rank, N_total] - place each shard at correct offset."""
-                # If full shape matches, direct copy (non-stacked layer).
-                if param.data.shape == loaded_weight.shape:
-                    param.data.copy_(loaded_weight)
-                    return
-                # Stacked case: determine shard offset from shard_id.
+            def _get_shard_idx(args, kwargs):
+                """Extract shard index from loader arguments."""
                 shard_id = None
                 if args:
                     shard_id = args[0]
                 if shard_id is None:
                     shard_id = kwargs.get("shard_id", None)
                 if shard_id is None:
-                    # Fallback: cannot determine placement, skip.
-                    return
-                # Map shard_id to integer index.
-                # QKV uses "q"/"k"/"v"; gate_up uses 0/1.
+                    return None
                 shard_map = {"q": 0, "k": 1, "v": 2}
                 if isinstance(shard_id, str):
-                    idx = shard_map.get(shard_id)
-                    if idx is None:
-                        return
-                else:
-                    idx = int(shard_id)
-                # Compute offset along output dim (dim=1 of U).
+                    return shard_map.get(shard_id)
+                return int(shard_id)
+
+            def _v_loader(param, loaded_weight, *args, **kwargs):
+                """V: [K, num_shards * rank] - each shard at its rank slice."""
+                # Non-stacked: full shape match → direct copy.
+                if param.data.shape == loaded_weight.shape:
+                    param.data.copy_(loaded_weight)
+                    return
+                idx = _get_shard_idx(args, kwargs)
+                if idx is None:
+                    # Single-shard fallback: if loaded is [K, rank], put at 0.
+                    if (loaded_weight.shape[0] == param.data.shape[0]
+                            and loaded_weight.shape[1] == rank):
+                        param.data[:, :rank].copy_(loaded_weight)
+                    return
+                # Place V_i at columns [idx*rank : (idx+1)*rank]
+                col_start = idx * rank
+                if (loaded_weight.shape[0] == param.data.shape[0]
+                        and loaded_weight.shape[1] == rank):
+                    param.data[:, col_start:col_start + rank].copy_(
+                        loaded_weight)
+
+            def _u_loader(param, loaded_weight, *args, **kwargs):
+                """U: [num_shards * rank, N] - each shard's U at correct block."""
+                # Non-stacked: full shape match → direct copy.
+                if param.data.shape == loaded_weight.shape:
+                    param.data.copy_(loaded_weight)
+                    return
+                idx = _get_shard_idx(args, kwargs)
+                if idx is None:
+                    return
                 sizes = getattr(layer, "_milo_output_partition_sizes", None)
                 if sizes is None:
                     return
-                offset = sum(sizes[:idx])
-                shard_size = sizes[idx]
-                # Validate: loaded_weight should be [rank, shard_size]
-                if loaded_weight.shape[0] != param.data.shape[0]:
+                # Row block for this shard's rank slice.
+                row_start = idx * rank
+                # Column offset in output dim.
+                col_start = sum(sizes[:idx])
+                col_size = sizes[idx]
+                # Validate shape.
+                if loaded_weight.shape[0] != rank:
                     return
-                if loaded_weight.shape[1] != shard_size:
-                    # TP case: loaded_weight might cover full shard before TP split
-                    # For now just try direct placement if sizes match
-                    if loaded_weight.shape[1] <= shard_size:
-                        shard_size = loaded_weight.shape[1]
+                if loaded_weight.shape[1] != col_size:
+                    if loaded_weight.shape[1] <= col_size:
+                        col_size = loaded_weight.shape[1]
                     else:
                         return
-                param.data[:, offset:offset + shard_size].copy_(loaded_weight)
+                param.data[row_start:row_start + rank,
+                           col_start:col_start + col_size].copy_(
+                    loaded_weight)
 
             V = torch.nn.Parameter(
-                torch.empty(K, self.rank, dtype=params_dtype),
+                torch.zeros(K, num_shards * rank, dtype=params_dtype),
                 requires_grad=False,
             )
             U = torch.nn.Parameter(
-                torch.zeros(self.rank, N, dtype=params_dtype),
+                torch.zeros(num_shards * rank, N, dtype=params_dtype),
                 requires_grad=False,
             )
             V.weight_loader = _v_loader
