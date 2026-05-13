@@ -199,11 +199,13 @@ class MiloConfig(QuantizationConfig):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
-        if hf_quant_cfg is None:
-            return None
-        quant_method = hf_quant_cfg.get("quant_method", "").lower()
-        if quant_method == "milo":
-            return cls.get_name()
+        # MiLo is a non-override (primary) backend: the checkpoint's
+        # `config.json["quantization_config"]["quant_method"]` is literally
+        # `"milo"`, so vLLM's main resolver picks `MiloConfig` directly via
+        # the `quantization_methods` registry — there is no other backend
+        # whose checkpoint we want to "claim".  Returning None here keeps
+        # `milo` out of the override list (see vllm/config/model.py:962),
+        # which avoids the "not in overrides list above" pydantic error.
         return None
 
     def get_quant_method(
