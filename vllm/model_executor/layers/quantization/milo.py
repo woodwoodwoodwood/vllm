@@ -818,3 +818,34 @@ class MiloMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(self, layer):
         """Return the metadata that vLLM uses to pick the right runner."""
         return None
+
+    def apply_monolithic(
+        self,
+        layer,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Entry point called by MoERunner for monolithic quant methods.
+
+        We run the router ourselves (softmax + topk) then delegate to
+        self.apply(...) which does the full MiLo INT3 MoE forward.
+        """
+        # Run router: softmax over expert logits → top-k selection
+        routing_weights = torch.softmax(
+            router_logits, dim=-1, dtype=torch.float32
+        )
+        topk_weights, topk_ids = torch.topk(
+            routing_weights, k=layer.top_k, dim=-1
+        )
+        if layer.renormalize:
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=-1, keepdim=True
+            )
+
+        return self.apply(
+            layer=layer,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
