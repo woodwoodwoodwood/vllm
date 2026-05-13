@@ -14,6 +14,8 @@ from vllm import LLM, SamplingParams
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="/usr/local/app/models/Qwen1.5-MoE-A2.7B-vllm-int3")
+    parser.add_argument("--quantization", default="milo",
+                        help="Quantization method, e.g. 'milo' or None for fp16")
     parser.add_argument("--num-prompts", type=int, default=100)
     parser.add_argument("--input-len", type=int, default=128)
     parser.add_argument("--output-len", type=int, default=128)
@@ -27,14 +29,16 @@ def main():
     print(f"max_model_len: {max_model_len}")
     print()
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model,
-        quantization="milo",
         dtype="float16",
         max_model_len=max_model_len,
         gpu_memory_utilization=0.5,
         enforce_eager=True,
     )
+    if args.quantization and args.quantization.lower() != "none":
+        llm_kwargs["quantization"] = args.quantization
+    llm = LLM(**llm_kwargs)
 
     tokenizer = llm.get_tokenizer()
     # Build fixed-length prompts by repeating a token
