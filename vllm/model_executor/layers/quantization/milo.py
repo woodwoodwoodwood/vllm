@@ -802,9 +802,9 @@ class MiloMoEMethod(FusedMoEMethodBase):
         del h_sorted
 
         # ---- 6. Scatter-add with routing weights ----
-        # topk_weights: [M, top_k], sorted_token_ids indexes into [0, M)
+        # topk_weights: [M, top_k] fp32, sorted_token_ids indexes into [0, M)
         w_sorted = topk_weights[sorted_token_ids, sorted_slot_ids]  # [M_total]
-        down_weighted = down_sorted * w_sorted.unsqueeze(-1)
+        down_weighted = (down_sorted * w_sorted.unsqueeze(-1)).to(torch.float16)
         del down_sorted
 
         out = torch.zeros(M, K, dtype=torch.float16, device=device)
