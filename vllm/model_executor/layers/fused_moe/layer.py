@@ -1379,8 +1379,9 @@ class FusedMoE(PluggableLayer):
             )
             return True if return_success else None
 
-        # Case model weights
-        if "weight" in weight_name:
+        # Case model weights (also serves as fallback for custom quant
+        # methods like MiLo whose buffer names don't contain "weight").
+        if True:
             self._load_model_weight_or_group_weight_scale(
                 shard_id=shard_id,
                 shard_dim=shard_dim,
@@ -1389,8 +1390,6 @@ class FusedMoE(PluggableLayer):
                 tp_rank=self.tp_rank,
             )
             return True if return_success else None
-
-        return False if return_success else None
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
