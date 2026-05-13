@@ -577,6 +577,9 @@ class MiloMoEMethod(FusedMoEMethodBase):
             "is_transposed": True,
             "quant_method": "group",
         })
+        logger.info("MiloMoEMethod.create_weights: E=%d K=%d I=%d rank=%d "
+                    "extra_keys=%s", num_experts, K, I, rank,
+                    list(extra_weight_attrs.keys()))
 
         # ---------- w13 (gate + up, fused along N=2*I) ----------
         def _reg(name, shape, dtype=torch.int32):
