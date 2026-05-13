@@ -550,29 +550,55 @@ class MiloMoEMethod(FusedMoEMethodBase):
         E = layer.milo_num_experts
         rank = layer.milo_rank
 
-        tile_gu_n, tile_gu_k = _pick_kernel_tile(I, K)
+        # Gate+Up fused rail: use w13 weights directly (shape [E, K/16, 2I])
+        # instead of splitting into separate gate/up rails.
+        tile_gu_n, tile_gu_k = _pick_kernel_tile(2 * I, K)
+        if tile_gu_n < 0:
+            # Fallback: use separate tiles for gate and up
+            tile_gu_n_sep, tile_gu_k_sep = _pick_kernel_tile(I, K)
+            if tile_gu_n_sep < 0:
+                raise RuntimeError(
+                    f"MiloMoEMethod: no kernel tile for gate/up "
+                    f"prob_n={I} prob_k={K}."
+                )
+            layer._milo_gate_up_fused = False
+            tile_gu_n, tile_gu_k = tile_gu_n_sep, tile_gu_k_sep
+            # Split w13 into gate (first I cols) and up (last I cols)
+            gate_B1 = layer.w13_Wq_packed1[:, :, :I].contiguous()
+            up_B1   = layer.w13_Wq_packed1[:, :, I:].contiguous()
+            gate_B2 = layer.w13_Wq_packed2[:, :, :I//2].contiguous()
+            up_B2   = layer.w13_Wq_packed2[:, :, I//2:].contiguous()
+            gate_scales = layer.w13_scales[:, :, :I].contiguous()
+            up_scales   = layer.w13_scales[:, :, I:].contiguous()
+            gate_zeros  = layer.w13_zeros[:, :, :I].contiguous()
+            up_zeros    = layer.w13_zeros[:, :, I:].contiguous()
+            layer._milo_gate_rail = MiLoMoERail(
+                B1=gate_B1, B2=gate_B2, scales=gate_scales, zeros=gate_zeros,
+                prob_n=I, prob_k=K, group_size=gs,
+                thread_n=tile_gu_n, thread_k=tile_gu_k, num_experts=E,
+            )
+            layer._milo_up_rail = MiLoMoERail(
+                B1=up_B1, B2=up_B2, scales=up_scales, zeros=up_zeros,
+                prob_n=I, prob_k=K, group_size=gs,
+                thread_n=tile_gu_n, thread_k=tile_gu_k, num_experts=E,
+            )
+        else:
+            layer._milo_gate_up_fused = True
+            layer._milo_gate_up_rail = MiLoMoERail(
+                B1=layer.w13_Wq_packed1,
+                B2=layer.w13_Wq_packed2,
+                scales=layer.w13_scales,
+                zeros=layer.w13_zeros,
+                prob_n=2 * I, prob_k=K, group_size=gs,
+                thread_n=tile_gu_n, thread_k=tile_gu_k, num_experts=E,
+            )
+
         tile_dn_n, tile_dn_k = _pick_kernel_tile(K, I)
-
-        # Split w13 into gate (first I cols) and up (last I cols)
-        gate_B1 = layer.w13_Wq_packed1[:, :, :I].contiguous()
-        up_B1   = layer.w13_Wq_packed1[:, :, I:].contiguous()
-        gate_B2 = layer.w13_Wq_packed2[:, :, :I//2].contiguous()
-        up_B2   = layer.w13_Wq_packed2[:, :, I//2:].contiguous()
-        gate_scales = layer.w13_scales[:, :, :I].contiguous()
-        up_scales   = layer.w13_scales[:, :, I:].contiguous()
-        gate_zeros  = layer.w13_zeros[:, :, :I].contiguous()
-        up_zeros    = layer.w13_zeros[:, :, I:].contiguous()
-
-        layer._milo_gate_rail = MiLoMoERail(
-            B1=gate_B1, B2=gate_B2, scales=gate_scales, zeros=gate_zeros,
-            prob_n=I, prob_k=K, group_size=gs,
-            thread_n=tile_gu_n, thread_k=tile_gu_k, num_experts=E,
-        )
-        layer._milo_up_rail = MiLoMoERail(
-            B1=up_B1, B2=up_B2, scales=up_scales, zeros=up_zeros,
-            prob_n=I, prob_k=K, group_size=gs,
-            thread_n=tile_gu_n, thread_k=tile_gu_k, num_experts=E,
-        )
+        if tile_dn_n < 0:
+            raise RuntimeError(
+                f"MiloMoEMethod: no kernel tile for down "
+                f"prob_n={K} prob_k={I}."
+            )
         layer._milo_down_rail = MiLoMoERail(
             B1=layer.w2_Wq_packed1, B2=layer.w2_Wq_packed2,
             scales=layer.w2_scales, zeros=layer.w2_zeros,
@@ -581,15 +607,20 @@ class MiloMoEMethod(FusedMoEMethodBase):
         )
 
         if rank > 0:
-            layer._milo_gate_V = layer.w13_V
-            layer._milo_gate_U = layer.w13_U[:, :, :I].contiguous()
-            layer._milo_up_V   = layer.w13_V
-            layer._milo_up_U   = layer.w13_U[:, :, I:].contiguous()
+            if layer._milo_gate_up_fused:
+                # Fused gate+up: V is shared, U is [E, rank, 2I] (already
+                # the original shape, no split needed)
+                layer._milo_gate_up_V = layer.w13_V
+                layer._milo_gate_up_U = layer.w13_U
+            else:
+                layer._milo_gate_V = layer.w13_V
+                layer._milo_gate_U = layer.w13_U[:, :, :I].contiguous()
+                layer._milo_up_V   = layer.w13_V
+                layer._milo_up_U   = layer.w13_U[:, :, I:].contiguous()
             layer._milo_down_V = layer.w2_V
             layer._milo_down_U = layer.w2_U
         else:
-            layer._milo_gate_V = layer._milo_gate_U = None
-            layer._milo_up_V = layer._milo_up_U = None
+            layer._milo_gate_up_V = layer._milo_gate_up_U = None
             layer._milo_down_V = layer._milo_down_U = None
 
         # Free raw buffers
@@ -629,7 +660,9 @@ class MiloMoEMethod(FusedMoEMethodBase):
         top_k = topk_ids.shape[-1]
         I = layer.milo_intermediate_size
         E = layer.milo_num_experts
-        has_comp = layer._milo_gate_V is not None
+        fused = layer._milo_gate_up_fused
+        has_comp = (layer._milo_gate_up_V is not None
+                    if fused else layer._milo_gate_V is not None)
 
         # 1. Sorted dispatch
         flat_experts = topk_ids.reshape(-1)
@@ -644,30 +677,46 @@ class MiloMoEMethod(FusedMoEMethodBase):
 
         x_sorted = x_2d[sorted_token_ids].contiguous()
 
-        # 2. Gate rail
-        gate_rail = layer._milo_gate_rail
-        work_gate = build_moe_block_descriptors(
-            bin_edges_cpu, active_experts,
-            prob_n=I, thread_n=gate_rail.thread_n,
-        ).to(device, non_blocking=True)
-        gate_sorted = milo_int3_moe(x_sorted, gate_rail, work_gate)
-        if has_comp:
-            compensator_batched(
-                x_sorted, layer._milo_gate_V, layer._milo_gate_U,
-                active_experts, bin_edges_cpu, gate_sorted)
+        # 2. Gate+Up (fused or separate)
+        if fused:
+            gate_up_rail = layer._milo_gate_up_rail
+            work_gate_up = build_moe_block_descriptors(
+                bin_edges_cpu, active_experts,
+                prob_n=2 * I, thread_n=gate_up_rail.thread_n,
+            ).to(device, non_blocking=True)
+            gate_up_sorted = milo_int3_moe(
+                x_sorted, gate_up_rail, work_gate_up)
+            if has_comp:
+                compensator_batched(
+                    x_sorted, layer._milo_gate_up_V,
+                    layer._milo_gate_up_U,
+                    active_experts, bin_edges_cpu, gate_up_sorted)
+            # SwiGLU: split then activate
+            gate_sorted = gate_up_sorted[:, :I]
+            up_sorted = gate_up_sorted[:, I:]
+            h_sorted = torch.nn.functional.silu(gate_sorted) * up_sorted
+            del gate_sorted, up_sorted, gate_up_sorted
+        else:
+            gate_rail = layer._milo_gate_rail
+            work_gate = build_moe_block_descriptors(
+                bin_edges_cpu, active_experts,
+                prob_n=I, thread_n=gate_rail.thread_n,
+            ).to(device, non_blocking=True)
+            gate_sorted = milo_int3_moe(x_sorted, gate_rail, work_gate)
+            if has_comp:
+                compensator_batched(
+                    x_sorted, layer._milo_gate_V, layer._milo_gate_U,
+                    active_experts, bin_edges_cpu, gate_sorted)
+            up_sorted = milo_int3_moe(
+                x_sorted, layer._milo_up_rail, work_gate)
+            if has_comp:
+                compensator_batched(
+                    x_sorted, layer._milo_up_V, layer._milo_up_U,
+                    active_experts, bin_edges_cpu, up_sorted)
+            h_sorted = torch.nn.functional.silu(gate_sorted) * up_sorted
+            del gate_sorted, up_sorted
 
-        # 3. Up rail
-        up_sorted = milo_int3_moe(x_sorted, layer._milo_up_rail, work_gate)
-        if has_comp:
-            compensator_batched(
-                x_sorted, layer._milo_up_V, layer._milo_up_U,
-                active_experts, bin_edges_cpu, up_sorted)
-
-        # 4. SwiGLU
-        h_sorted = torch.nn.functional.silu(gate_sorted) * up_sorted
-        del gate_sorted, up_sorted
-
-        # 5. Down rail
+        # 3. Down rail
         down_rail = layer._milo_down_rail
         work_down = build_moe_block_descriptors(
             bin_edges_cpu, active_experts,
@@ -680,7 +729,7 @@ class MiloMoEMethod(FusedMoEMethodBase):
                 active_experts, bin_edges_cpu, down_sorted)
         del h_sorted
 
-        # 6. Scatter-add with routing weights
+        # 4. Scatter-add with routing weights
         w_sorted = topk_weights[sorted_token_ids, sorted_slot_ids]
         down_weighted = (down_sorted * w_sorted.unsqueeze(-1)).to(
             torch.float16)
