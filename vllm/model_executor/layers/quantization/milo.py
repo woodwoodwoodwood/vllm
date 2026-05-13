@@ -313,26 +313,73 @@ class MiloLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
         layer.register_parameter("zeros", zeros)
 
-        # V/U: rank dimension is independent of N; use a direct-copy loader
-        # that ignores shard_id so QKV/gate-up stacking won't try to narrow.
-        # For QKV-stacked layers, q/k/v each have independent V/U of shape
-        # [K, rank]; we keep only V (all same K, same rank) and stack U
-        # along the output dimension manually.
+        # V/U compensator for stacked layers (QKV, gate_up):
+        # - V is [K, rank] and shared across all shards (same input dim).
+        #   We simply copy from any shard (they should all be identical).
+        # - U is [rank, N_total] where N_total = sum(output_partition_sizes).
+        #   Each shard contributes [rank, N_shard] which must be placed at
+        #   the correct offset along dim=1.
         if self.rank > 0:
-            def _comp_loader(param, loaded_weight, *args, **kwargs):
+            # Store partition info for the U loader to compute offsets.
+            layer._milo_output_partition_sizes = list(output_partition_sizes)
+
+            def _v_loader(param, loaded_weight, *args, **kwargs):
+                """V: [K, rank] - same for all shards, just copy."""
                 if param.data.shape == loaded_weight.shape:
                     param.data.copy_(loaded_weight)
+
+            def _u_loader(param, loaded_weight, *args, **kwargs):
+                """U: [rank, N_total] - place each shard at correct offset."""
+                # If full shape matches, direct copy (non-stacked layer).
+                if param.data.shape == loaded_weight.shape:
+                    param.data.copy_(loaded_weight)
+                    return
+                # Stacked case: determine shard offset from shard_id.
+                shard_id = None
+                if args:
+                    shard_id = args[0]
+                if shard_id is None:
+                    shard_id = kwargs.get("shard_id", None)
+                if shard_id is None:
+                    # Fallback: cannot determine placement, skip.
+                    return
+                # Map shard_id to integer index.
+                # QKV uses "q"/"k"/"v"; gate_up uses 0/1.
+                shard_map = {"q": 0, "k": 1, "v": 2}
+                if isinstance(shard_id, str):
+                    idx = shard_map.get(shard_id)
+                    if idx is None:
+                        return
+                else:
+                    idx = int(shard_id)
+                # Compute offset along output dim (dim=1 of U).
+                sizes = getattr(layer, "_milo_output_partition_sizes", None)
+                if sizes is None:
+                    return
+                offset = sum(sizes[:idx])
+                shard_size = sizes[idx]
+                # Validate: loaded_weight should be [rank, shard_size]
+                if loaded_weight.shape[0] != param.data.shape[0]:
+                    return
+                if loaded_weight.shape[1] != shard_size:
+                    # TP case: loaded_weight might cover full shard before TP split
+                    # For now just try direct placement if sizes match
+                    if loaded_weight.shape[1] <= shard_size:
+                        shard_size = loaded_weight.shape[1]
+                    else:
+                        return
+                param.data[:, offset:offset + shard_size].copy_(loaded_weight)
 
             V = torch.nn.Parameter(
                 torch.empty(K, self.rank, dtype=params_dtype),
                 requires_grad=False,
             )
             U = torch.nn.Parameter(
-                torch.empty(self.rank, N, dtype=params_dtype),
+                torch.zeros(self.rank, N, dtype=params_dtype),
                 requires_grad=False,
             )
-            V.weight_loader = _comp_loader
-            U.weight_loader = _comp_loader
+            V.weight_loader = _v_loader
+            U.weight_loader = _u_loader
             layer.register_parameter("V", V)
             layer.register_parameter("U", U)
         else:
@@ -381,13 +428,8 @@ class MiloLinearMethod(LinearMethodBase):
         )
 
         if layer.V is not None and layer.U is not None:
-            # TEMP: skip compensator on dense linears (attn / shared_expert)
-            # because QKV/gate_up stacking corrupts V/U layout.  MoE experts
-            # are unaffected (no stacking).
-            import os
-            if os.environ.get("MILO_LINEAR_COMPENSATOR", "0") == "1":
-                tmp = torch.mm(x_2d, layer.V)
-                out.addmm_(tmp, layer.U)
+            tmp = torch.mm(x_2d, layer.V)
+            out.addmm_(tmp, layer.U)
 
         if bias is not None:
             out = out + bias.to(torch.float16)
