@@ -511,13 +511,21 @@ class MiloMoEMethod(FusedMoEMethodBase):
         5. SwiGLU between gate/up; reduce-by-routing-weight; scatter-add.
     """
 
+    # Monolithic: this method owns the full MoE forward; vLLM should NOT
+    # try to wrap it in the modular kernel framework.
+    is_monolithic = True
+
     def __init__(self, quant_config: MiloConfig, moe_config):
         super().__init__(moe_config)
         self.quant_config = quant_config
-        # Resolve MiLo runtime modules (will raise if missing).
-        self._milo_cuda, self._milo_moe, self._compbatch = _import_milo()
-        # Defer kernel-tile selection until we know (K, N) per rail.
-        self._tile_cache: dict[tuple[int, int], tuple[int, int]] = {}
+        # Lazy-import MiLo runtime (only needed at forward time).
+        self._milo_moe = None
+        self._compbatch = None
+
+    def _ensure_runtime(self):
+        if self._milo_moe is not None:
+            return
+        _, self._milo_moe, self._compbatch = _import_milo()
 
     # ------------------------------------------------------------------
     #  Weight registration
@@ -533,61 +541,84 @@ class MiloMoEMethod(FusedMoEMethodBase):
     ) -> None:
         """Register raw INT3-packed buffers for w13 (gate+up) and w2 (down).
 
-        Layout convention (matches MiLo `Layer3bitWithZeros.pack`):
-            For each expert and each rail (in_features=K, out_features=N):
-                B1     [K/16, N]            int32
-                B2     [K/16, N/2]          int32
-                scales [K/gs, N]            params_dtype
-                zeros  [K/gs, N]            params_dtype
-                V      [K, rank]            params_dtype  (compensator lhs)
-                U      [rank, N]            params_dtype  (compensator rhs)
+        Layout per expert:
+            w13 (gate+up fused, N = 2*I):
+                Wq_packed1  [K/16,  2*I]       int32
+                Wq_packed2  [K/16,  I]         int32   (N/2 = I)
+                scales      [K/gs,  2*I]       params_dtype
+                zeros       [K/gs,  2*I]       params_dtype
+                V           [K,     rank]      params_dtype
+                U           [rank,  2*I]       params_dtype
+            w2 (down, K_in=I, N_out=H):
+                Wq_packed1  [I/16,  H]         int32
+                Wq_packed2  [I/16,  H/2]       int32
+                scales      [I/gs,  H]         params_dtype
+                zeros       [I/gs,  H]         params_dtype
+                V           [I,     rank]      params_dtype
+                U           [rank,  H]         params_dtype
 
-        FusedMoE convention stacks gate+up into w13 with N = 2*I (gate first,
-        then up).  We follow the same convention.
+        Parameters are registered with shape [num_experts, ...] and
+        `is_transposed=True` so vLLM's weight_loader slices along the
+        correct dim when filling gate(w1) vs up(w3) halves.
         """
-        # TODO(milo): fill in.  For each of w13_/w2_:
-        #   - register Wq_packed1 / Wq_packed2 / scales / zeros / V / U
-        #     as nn.Parameter with the correct expert-stacked shape
-        #   - attach a custom `weight_loader` (or use vLLM's default) so the
-        #     converter-produced safetensors keys map to the right slices
-        #   - call `set_weight_attrs(param, extra_weight_attrs)` so vLLM
-        #     can do TP / EP sharding correctly
-        raise NotImplementedError(
-            "MiloMoEMethod.create_weights is not implemented yet.  "
-            "See vllm/model_executor/layers/quantization/awq_marlin.py "
-            "AWQMarlinMoEMethod.create_weights for the pattern to follow."
+        from vllm.model_executor.utils import set_weight_attrs
+
+        gs = self.quant_config.group_size
+        K = hidden_size
+        I = intermediate_size_per_partition
+        rank = self.quant_config.resolve_compensator_rank(
+            "mlp.experts"  # MoE experts always use the expert rank
         )
+
+        # Mark transposed so weight_loader flips shard_dim correctly.
+        extra_weight_attrs.update({"is_transposed": True})
+
+        # ---------- w13 (gate + up, fused along N=2*I) ----------
+        def _reg(name, shape, dtype=torch.int32):
+            p = torch.nn.Parameter(
+                torch.empty(num_experts, *shape, dtype=dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter(name, p)
+            set_weight_attrs(p, extra_weight_attrs)
+
+        _reg("w13_Wq_packed1", (K // 16,  2 * I), torch.int32)
+        _reg("w13_Wq_packed2", (K // 16,  I),     torch.int32)     # N/2
+        _reg("w13_scales",     (K // gs,  2 * I), params_dtype)
+        _reg("w13_zeros",      (K // gs,  2 * I), params_dtype)
+        if rank > 0:
+            _reg("w13_V",      (K,        rank),  params_dtype)
+            _reg("w13_U",      (rank,     2 * I), params_dtype)
+
+        # ---------- w2 (down: K_in=I, N_out=H) ----------
+        _reg("w2_Wq_packed1",  (I // 16,  K),     torch.int32)
+        _reg("w2_Wq_packed2",  (I // 16,  K // 2), torch.int32)
+        _reg("w2_scales",      (I // gs,  K),     params_dtype)
+        _reg("w2_zeros",       (I // gs,  K),     params_dtype)
+        if rank > 0:
+            _reg("w2_V",       (I,        rank),  params_dtype)
+            _reg("w2_U",       (rank,     K),     params_dtype)
+
+        # Save metadata for process_weights_after_loading / apply.
+        layer.milo_num_experts = num_experts
+        layer.milo_hidden_size = K
+        layer.milo_intermediate_size = I
+        layer.milo_group_size = gs
+        layer.milo_rank = rank
 
     # ------------------------------------------------------------------
     #  Layout finalisation after all weights are loaded
     # ------------------------------------------------------------------
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Convert raw expert-stacked buffers into MiLoMoERail form, build
-        compensator bmm caches, and pre-compute kernel-tile selection.
+        """Pre-compute kernel tile selection for each rail."""
+        K = layer.milo_hidden_size
+        I = layer.milo_intermediate_size
 
-        After this call the layer should expose:
-            layer._milo_gate_rail : MiLoMoERail
-            layer._milo_up_rail   : MiLoMoERail
-            layer._milo_down_rail : MiLoMoERail
-            layer._milo_gate_V / _milo_gate_U : torch.Tensor
-            layer._milo_up_V   / _milo_up_U   : torch.Tensor
-            layer._milo_down_V / _milo_down_U : torch.Tensor
-        """
-        # TODO(milo): implement.  Algorithm:
-        #   1. Split layer.w13_qweight into gate (first I cols) and up (last I cols).
-        #      Same for w13_scales / w13_zeros / w13_V / w13_U.
-        #   2. For each rail, build a MiLoMoERail dataclass (do NOT call
-        #      `stack_from_experts` — that expects nn.Module instances; just
-        #      construct the dataclass directly with the already-stacked
-        #      tensors).
-        #   3. For each rail, stack V/U via
-        #      `compensator_batched.stack_compensator_weights`.
-        #   4. Free the now-redundant per-expert buffers
-        #      (set layer.w13_qweight = None; gc.collect; cuda.empty_cache).
-        raise NotImplementedError(
-            "MiloMoEMethod.process_weights_after_loading is not "
-            "implemented yet."
-        )
+        # gate/up rail: prob_k=K, prob_n=I  (we split w13 into two halves)
+        layer.milo_tile_gate = MiloLinearMethod._pick_kernel_tile(I, K)
+        layer.milo_tile_up   = layer.milo_tile_gate  # same shape
+        # down rail: prob_k=I, prob_n=K
+        layer.milo_tile_down = MiloLinearMethod._pick_kernel_tile(K, I)
 
     # ------------------------------------------------------------------
     #  Forward
@@ -603,51 +634,14 @@ class MiloMoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         """MiLo INT3 + compensator MoE forward.
 
-        Args:
-            x: [N, H] fp16/bf16 — flattened token activations after router.
-            topk_weights: [N, top_k] fp32 — already softmaxed.
-            topk_ids:     [N, top_k] int32 — selected expert ids per token.
-
-        Returns:
-            [N, H] in the same dtype as `x`.
+        TODO(milo): implement full fused path using milo_int3_moe kernel.
+        For now raises NotImplementedError.
         """
-        # TODO(milo): implement.  Algorithm:
-        #
-        #   1. Sorted dispatch (verbatim port from
-        #      `_moe_forward_moefused` in MiLo/models/hf/qwen3_moe.py):
-        #        flat_experts = topk_ids.reshape(-1)
-        #        sort_idx     = torch.argsort(flat_experts)
-        #        sorted_tokens = ...
-        #        bin_edges    = bincount.cumsum(0)
-        #        x_sorted     = x.index_select(0, sorted_tokens)
-        #
-        #   2. Build MoE block descriptors:
-        #        work = self._milo_moe.build_moe_block_descriptors(
-        #            bin_edges_cpu, active_experts,
-        #            prob_n=I, thread_n=gate_rail.thread_n)
-        #        work = work.to(device, non_blocking=True)
-        #
-        #   3. Layer 1a (gate):
-        #        gate_sorted = self._milo_moe.milo_int3_moe(
-        #            x_sorted, layer._milo_gate_rail, work)
-        #        self._compbatch.compensator_batched(
-        #            x_sorted, layer._milo_gate_V, layer._milo_gate_U,
-        #            active_experts, bin_edges_cpu, gate_sorted)
-        #
-        #   4. Layer 1b (up): same as gate.
-        #
-        #   5. SwiGLU:  h_sorted = F.silu(gate_sorted) * up_sorted
-        #
-        #   6. Layer 2 (down): same pattern; use a separate `work_down`
-        #      descriptor since (prob_n_down, thread_n_down) differ.
-        #
-        #   7. Apply routing weights and scatter-add back.
         raise NotImplementedError(
-            "MiloMoEMethod.apply is not implemented yet."
+            "MiloMoEMethod.apply is not implemented yet (Step 3c).  "
+            "Weight registration and loading (Step 3b) are complete."
         )
 
     def get_fused_moe_quant_config(self, layer):
         """Return the metadata that vLLM uses to pick the right runner."""
-        # TODO(milo): adapt to the schema in fused_moe/config.py.  For
-        # now return None to force the monolithic apply() path.
         return None
