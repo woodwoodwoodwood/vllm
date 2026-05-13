@@ -381,8 +381,13 @@ class MiloLinearMethod(LinearMethodBase):
         )
 
         if layer.V is not None and layer.U is not None:
-            tmp = torch.mm(x_2d, layer.V)
-            out.addmm_(tmp, layer.U)
+            # TEMP: skip compensator on dense linears (attn / shared_expert)
+            # because QKV/gate_up stacking corrupts V/U layout.  MoE experts
+            # are unaffected (no stacking).
+            import os
+            if os.environ.get("MILO_LINEAR_COMPENSATOR", "0") == "1":
+                tmp = torch.mm(x_2d, layer.V)
+                out.addmm_(tmp, layer.U)
 
         if bias is not None:
             out = out + bias.to(torch.float16)
