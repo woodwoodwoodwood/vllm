@@ -448,6 +448,44 @@ class MiloLinearMethod(LinearMethodBase):
         """Pick the kernel tile + allocate the workspace lock buffer."""
         N = layer.output_size_per_partition
         K = layer.input_size_per_partition
+
+        # Debug: check qkv_proj B1 on first call
+        B1 = layer.Wq_packed1
+        logger.info(
+            "DEBUG Linear process_weights: prefix=%s K=%d N=%d "
+            "B1 shape=%s nonzero=%d/%d B1[:2,:2]=%s",
+            self.prefix, K, N, list(B1.shape),
+            (B1 != 0).sum().item(), B1.numel(),
+            B1[:2, :2].cpu().tolist(),
+        )
+        # For qkv_proj: compare q portion with raw ckpt
+        if "qkv_proj" in self.prefix or "gate_up_proj" in self.prefix:
+            try:
+                import json as _json
+                from safetensors.torch import load_file as _lf
+                _ckpt = "/usr/local/app/models/Qwen1.5-MoE-A2.7B-vllm-int3"
+                with open(f"{_ckpt}/model.safetensors.index.json") as _f:
+                    _idx = _json.load(_f)
+                if "qkv_proj" in self.prefix:
+                    _raw_key = self.prefix.replace("qkv_proj", "q_proj") + ".Wq_packed1"
+                    _shard_N = N // 3  # q/k/v each
+                else:
+                    _raw_key = self.prefix.replace("gate_up_proj", "gate_proj") + ".Wq_packed1"
+                    _shard_N = N // 2
+                if _raw_key in _idx["weight_map"]:
+                    _fname = _idx["weight_map"][_raw_key]
+                    _raw = _lf(f"{_ckpt}/{_fname}")[_raw_key]
+                    _loaded = B1[:, :_shard_N].cpu()
+                    _match = torch.equal(_loaded, _raw)
+                    logger.info(
+                        "DEBUG %s first-shard B1 match: %s "
+                        "(loaded[:2,:2]=%s raw[:2,:2]=%s)",
+                        self.prefix, _match,
+                        _loaded[:2, :2].tolist(), _raw[:2, :2].tolist(),
+                    )
+            except Exception as _e:
+                logger.warning("DEBUG check failed: %s", _e)
+
         thread_n, thread_k = self._pick_kernel_tile(N, K)
         if thread_n < 0:
             raise RuntimeError(
@@ -657,19 +695,35 @@ class MiloMoEMethod(FusedMoEMethodBase):
         rank = layer.milo_rank
 
         # Debug: verify expert 0 gate_proj B1 matches ckpt on first layer
-        if hasattr(layer, '_milo_debug_done'):
-            pass
-        else:
+        if not hasattr(layer, '_milo_debug_done'):
             layer._milo_debug_done = True
             w13 = layer.w13_Wq_packed1  # [E, K/16, 2*I]
             logger.info(
-                "DEBUG process_weights: w13_Wq_packed1 shape=%s, "
-                "expert0 gate [:2,:2]=%s, expert0 nonzero=%d/%d",
+                "DEBUG w13_Wq_packed1 shape=%s, "
+                "expert0 nonzero=%d/%d, expert0_gate[:2,:2]=%s",
                 list(w13.shape),
-                w13[0, :2, :2].tolist(),
-                (w13[0] != 0).sum().item(),
-                w13[0].numel(),
+                (w13[0] != 0).sum().item(), w13[0].numel(),
+                w13[0, :2, :2].cpu().tolist(),
             )
+            # Compare with raw ckpt
+            try:
+                import json as _json
+                from safetensors.torch import load_file as _lf
+                _ckpt = "/usr/local/app/models/Qwen1.5-MoE-A2.7B-vllm-int3"
+                with open(f"{_ckpt}/model.safetensors.index.json") as _f:
+                    _idx = _json.load(_f)
+                _key = "model.layers.0.mlp.experts.0.gate_proj.Wq_packed1"
+                _fname = _idx["weight_map"][_key]
+                _raw = _lf(f"{_ckpt}/{_fname}")[_key]
+                _loaded = w13[0, :, :I].cpu()
+                _match = torch.equal(_loaded, _raw)
+                logger.info("DEBUG expert0 gate B1 byte-exact match: %s "
+                           "(loaded[:2,:2]=%s, raw[:2,:2]=%s)",
+                           _match,
+                           _loaded[:2, :2].tolist(),
+                           _raw[:2, :2].tolist())
+            except Exception as _e:
+                logger.warning("DEBUG check failed: %s", _e)
 
         # Tile selection
         tile_gate_n, tile_gate_k = MiloLinearMethod._pick_kernel_tile(I, K)
