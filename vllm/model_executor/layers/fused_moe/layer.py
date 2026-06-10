@@ -1336,7 +1336,43 @@ class FusedMoE(PluggableLayer):
             # FusedMoeWeightScaleSupported
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
-            quant_method = getattr(param, "quant_method", None)
+            quant_method_raw = getattr(param, "quant_method", None)
+            quant_method = quant_method_raw
+            if quant_method is not None and not isinstance(quant_method, str):
+                quant_method = getattr(quant_method, "value", str(quant_method))
+            if isinstance(quant_method, str):
+                quant_method = quant_method.strip().lower()
+                if "." in quant_method:
+                    quant_method = quant_method.rsplit(".", 1)[-1]
+                quant_method_alias = {
+                    "input_scale": FusedMoeWeightScaleSupported.TENSOR.value,
+                    "global_scale": FusedMoeWeightScaleSupported.TENSOR.value,
+                    "weight_scale": FusedMoeWeightScaleSupported.TENSOR.value,
+                    "per_tensor": FusedMoeWeightScaleSupported.TENSOR.value,
+                    "tensorwise": FusedMoeWeightScaleSupported.TENSOR.value,
+                    "per_channel": FusedMoeWeightScaleSupported.CHANNEL.value,
+                    "channelwise": FusedMoeWeightScaleSupported.CHANNEL.value,
+                    "per_group": FusedMoeWeightScaleSupported.GROUP.value,
+                    "groupwise": FusedMoeWeightScaleSupported.GROUP.value,
+                    "per_block": FusedMoeWeightScaleSupported.BLOCK.value,
+                    "blockwise": FusedMoeWeightScaleSupported.BLOCK.value,
+                }
+                quant_method = quant_method_alias.get(quant_method, quant_method)
+
+            weight_name_tail = weight_name.rsplit(".", 1)[-1]
+            is_scale_like_name = any(
+                k in weight_name_tail
+                for k in (
+                    "global_scale",
+                    "weight_scale",
+                    "input_scale",
+                    "zero_point",
+                    "offset",
+                    "zero",
+                )
+            )
+            is_scalar_like = loaded_weight.ndim <= 1 or loaded_weight.numel() == 1
+
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,
@@ -1358,16 +1394,64 @@ class FusedMoE(PluggableLayer):
                     load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
-                self._load_per_tensor_weight_scale(
-                    shard_id=shard_id,
-                    param=param,
-                    loaded_weight=loaded_weight,
-                    expert_id=expert_id,
-                )
+                if is_scalar_like:
+                    self._load_per_tensor_weight_scale(
+                        shard_id=shard_id,
+                        param=param,
+                        loaded_weight=loaded_weight,
+                        expert_id=expert_id,
+                    )
+                else:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=self.tp_rank,
+                        load_full_w2=getattr(param, "load_full_w2", False),
+                    )
+            elif quant_method is None and is_scale_like_name:
+                if is_scalar_like:
+                    self._load_per_tensor_weight_scale(
+                        shard_id=shard_id,
+                        param=param,
+                        loaded_weight=loaded_weight,
+                        expert_id=expert_id,
+                    )
+                else:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=self.tp_rank,
+                        load_full_w2=getattr(param, "load_full_w2", False),
+                    )
+            elif is_scale_like_name:
+                if is_scalar_like:
+                    self._load_per_tensor_weight_scale(
+                        shard_id=shard_id,
+                        param=param,
+                        loaded_weight=loaded_weight,
+                        expert_id=expert_id,
+                    )
+                else:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=self.tp_rank,
+                        load_full_w2=getattr(param, "load_full_w2", False),
+                    )
             else:
                 WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
                 raise ValueError(
-                    f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}"
+                    "quant method must be one of "
+                    f"{WEIGHT_SCALE_SUPPORTED}, got quant_method={quant_method_raw!r} "
+                    f"(normalized={quant_method!r}), weight_name={weight_name}, "
+                    f"param_name={getattr(param, 'param_name', None)}, "
+                    f"loaded_shape={tuple(loaded_weight.shape)}"
                 )
             return True if return_success else None
 

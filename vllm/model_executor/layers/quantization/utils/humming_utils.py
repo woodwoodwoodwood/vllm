@@ -165,6 +165,15 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
 
 
 def get_humming_moe_quant_config(layer: FusedMoE):
+    if "w13" not in layer.input_schemas or "w13" not in layer.weight_schemas:
+        raise KeyError(
+            "Missing humming MoE schema key 'w13' when building fused MoE "
+            "quant config. "
+            f"input_schemas={list(layer.input_schemas.keys())}, "
+            f"weight_schemas={list(layer.weight_schemas.keys())}, "
+            f"layer={getattr(layer, 'layer_name', '<unknown>')}"
+        )
+
     input_schema = layer.input_schemas["w13"]
     weight_schema = layer.weight_schemas["w13"]
 

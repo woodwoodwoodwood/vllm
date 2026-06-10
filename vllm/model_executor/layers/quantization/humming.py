@@ -847,6 +847,10 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
                 del tensors
 
+            # persist current schemas for later fused MoE quant config build
+            layer.weight_schemas[sublayer_name] = weight_schema
+            layer.input_schemas[sublayer_name] = input_schema
+
             # prepare layer config from humming kernel
             HummingMethod.prepare_layer_meta(
                 layer=layer,
@@ -864,6 +868,9 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
             # preprocess weight for inference
             HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
+
+        # build quant config for fused MoE kernels
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
         # use moe modular
         experts: HummingIndexedExperts | HummingGroupedExperts
