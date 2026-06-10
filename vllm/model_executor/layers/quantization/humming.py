@@ -80,9 +80,34 @@ def prepare_padded_shape(shape, x):
     return padded_shape, padded_shape - shape
 
 
+def _normalize_scale_type(scale_type: Any) -> str | None:
+    if scale_type is None:
+        return None
+
+    value = getattr(scale_type, "value", scale_type)
+    if not isinstance(value, str):
+        value = str(value)
+
+    normalized = value.strip().lower()
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+
+    alias = {
+        "per_tensor": "tensor",
+        "tensorwise": "tensor",
+        "per_channel": "channel",
+        "channelwise": "channel",
+        "per_group": "group",
+        "groupwise": "group",
+        "per_block": "block",
+        "blockwise": "block",
+    }
+    return alias.get(normalized, normalized)
+
+
 def prepare_param(tensor, name, extra_attrs):
     extra_attrs = extra_attrs.copy()
-    scale_type = extra_attrs.pop("scale_type", None)
+    scale_type = _normalize_scale_type(extra_attrs.pop("scale_type", None))
     param_cls_name_map = {
         "block": BlockQuantScaleParameter,
         "tensor": PerTensorScaleParameter,
@@ -131,6 +156,7 @@ def prepare_param(tensor, name, extra_attrs):
 def prepare_moe_param(tensor, name, extra_attrs):
     param = torch.nn.Parameter(tensor, requires_grad=False)
     if "scale_type" in extra_attrs:
+        extra_attrs["scale_type"] = _normalize_scale_type(extra_attrs["scale_type"])
         extra_attrs["quant_method"] = extra_attrs["scale_type"]
 
     if "input_dim" in extra_attrs and "output_dim" in extra_attrs:
