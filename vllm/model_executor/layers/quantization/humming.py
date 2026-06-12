@@ -254,11 +254,19 @@ class HummingConfig(QuantizationConfig):
 
     def is_layer_skipped(self, config: dict[str, Any], prefix: str):
         keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
-        ignored_layers = self.get_from_keys_or(config, keys, []) or []
-        if hasattr(self, "hf_to_vllm_mapper"):
-            ignored_layers = self.hf_to_vllm_mapper.apply_list(ignored_layers)
+        raw_ignored_layers = self.get_from_keys_or(config, keys, []) or []
 
-        if any(module_name in prefix for module_name in ignored_layers):
+        # Check raw patterns first (preserves regex/substring patterns
+        # that don't map to specific weight names via _map_name).
+        if any(module_name in prefix for module_name in raw_ignored_layers):
+            return True
+
+        if hasattr(self, "hf_to_vllm_mapper"):
+            mapped = self.hf_to_vllm_mapper.apply_list(raw_ignored_layers)
+        else:
+            mapped = []
+
+        if any(module_name in prefix for module_name in mapped):
             return True
         if "lm_head" in prefix:
             return True
