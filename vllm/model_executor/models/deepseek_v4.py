@@ -1474,7 +1474,7 @@ class DeepseekV4Model(nn.Module):
                 loaded_params.add(name)
                 break
             else:
-                if ".experts." in name:
+                if ".experts." in name and ".shared_experts." not in name:
                     # E8M0 scales are stored as float8_e8m0fnu in
                     # checkpoints but the MoE param is uint8. copy_()
                     # would do a numeric conversion (e.g. 2^-7 → 0),
