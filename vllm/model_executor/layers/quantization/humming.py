@@ -386,7 +386,14 @@ class HummingConfig(QuantizationConfig):
                     Fp8LinearMethod,
                 )
 
-                fp8_config = Fp8Config(is_checkpoint_fp8_serialized=True)
+                # DeepSeek V4 uses block-wise FP8; weight_block_size
+                # defaults to [128, 128] if not explicitly configured.
+                fp8_kwargs = {"is_checkpoint_fp8_serialized": True}
+                if self.full_config:
+                    block_size = self.full_config.get("weight_block_size")
+                    if block_size is not None:
+                        fp8_kwargs["weight_block_size"] = block_size
+                fp8_config = Fp8Config(**fp8_kwargs)
                 return Fp8LinearMethod(fp8_config)
         elif isinstance(layer, LinearBase):
             return HummingLinearMethod(quant_config)
