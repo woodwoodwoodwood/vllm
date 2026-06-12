@@ -386,12 +386,8 @@ class HummingConfig(QuantizationConfig):
                     Fp8LinearMethod,
                 )
 
-                # DeepSeek V4 uses block-wise FP8; weight_block_size
-                # defaults to [128, 128] if not explicitly configured.
-                # DeepSeek V4 uses block-wise FP8 with weight_block_size
-                # [128, 128] to produce weight_scale_inv params.
-                # Use that as the default when the humming config
-                # doesn't carry an explicit block size.
+                # DeepSeek V4 uses block-wise FP8 (weight_block_size
+                # [128, 128]) to produce weight_scale_inv params.
                 fp8_kwargs = {"is_checkpoint_fp8_serialized": True}
                 block_size = None
                 if self.full_config:
