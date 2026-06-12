@@ -378,7 +378,16 @@ class HummingConfig(QuantizationConfig):
             if isinstance(layer, FusedMoE):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             elif isinstance(layer, LinearBase):
-                return UnquantizedLinearMethod()
+                # Layer is in the ignore list. Fall through to FP8 for
+                # mixed-quantization models (e.g., DeepSeek V4 where
+                # attention uses FP8 while MoE experts use humming).
+                from vllm.model_executor.layers.quantization.fp8 import (
+                    Fp8Config,
+                    Fp8LinearMethod,
+                )
+
+                fp8_config = Fp8Config(is_checkpoint_fp8_serialized=True)
+                return Fp8LinearMethod(fp8_config)
         elif isinstance(layer, LinearBase):
             return HummingLinearMethod(quant_config)
         elif isinstance(layer, FusedMoE):
