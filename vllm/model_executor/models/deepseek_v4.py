@@ -1466,7 +1466,9 @@ class DeepseekV4Model(nn.Module):
 
                 if is_pp_missing_parameter(name, self):
                     break
-                param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None:
+                    continue
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(name)
@@ -1489,7 +1491,9 @@ class DeepseekV4Model(nn.Module):
                         name_mapped = name.replace(weight_name, param_name)
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
-                        param = params_dict[name_mapped]
+                        param = params_dict.get(name_mapped)
+                        if param is None:
+                            continue
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
                         # available replicas.
@@ -1520,7 +1524,9 @@ class DeepseekV4Model(nn.Module):
                 else:
                     if is_pp_missing_parameter(name, self):
                         continue
-                    param = params_dict[name]
+                    param = params_dict.get(name)
+                    if param is None:
+                        continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
