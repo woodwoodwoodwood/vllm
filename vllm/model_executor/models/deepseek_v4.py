@@ -1474,7 +1474,7 @@ class DeepseekV4Model(nn.Module):
                 loaded_params.add(name)
                 break
             else:
-                if ".experts." in name and ".shared_experts." not in name:
+                if ".experts." in name:
                     # E8M0 scales are stored as float8_e8m0fnu in
                     # checkpoints but the MoE param is uint8. copy_()
                     # would do a numeric conversion (e.g. 2^-7 → 0),
@@ -1511,6 +1511,10 @@ class DeepseekV4Model(nn.Module):
                         if success:
                             name = name_mapped
                             break
+                    else:
+                        # No expert mapping matched (e.g. shared_experts).
+                        # Fall through to the default weight loader below.
+                        continue
                     loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:
