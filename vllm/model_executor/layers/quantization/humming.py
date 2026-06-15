@@ -378,21 +378,29 @@ class HummingConfig(QuantizationConfig):
             if isinstance(layer, FusedMoE):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             elif isinstance(layer, LinearBase):
-                # Layer is in the ignore list. Fall through to FP8 for
-                # mixed-quantization models (e.g., DeepSeek V4 where
-                # attention uses FP8 while MoE experts use humming).
-                from vllm.model_executor.layers.quantization.fp8 import (
-                    Fp8Config,
-                    Fp8LinearMethod,
-                )
-
-                fp8_kwargs = {"is_checkpoint_fp8_serialized": True}
+                # Layer is in the ignore list. Two cases:
+                #   1. DeepSeek V4: attention is block-FP8 — config has
+                #      weight_block_size. Fall through to FP8.
+                #   2. Qwen3-style: attention is plain BF16 — fall
+                #      through to the default unquantized linear method.
+                block_size = None
                 if self.full_config:
                     block_size = self.full_config.get("weight_block_size")
-                    if block_size is not None:
-                        fp8_kwargs["weight_block_size"] = block_size
-                fp8_config = Fp8Config(**fp8_kwargs)
-                return Fp8LinearMethod(fp8_config)
+                if block_size is not None:
+                    from vllm.model_executor.layers.quantization.fp8 import (
+                        Fp8Config,
+                        Fp8LinearMethod,
+                    )
+
+                    fp8_config = Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        weight_block_size=block_size,
+                    )
+                    return Fp8LinearMethod(fp8_config)
+                from vllm.model_executor.layers.linear import (
+                    UnquantizedLinearMethod,
+                )
+                return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
             return HummingLinearMethod(quant_config)
         elif isinstance(layer, FusedMoE):
